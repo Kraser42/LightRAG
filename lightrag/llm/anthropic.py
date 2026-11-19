@@ -165,6 +165,11 @@ async def anthropic_complete_if_cache(
         }
         if system_prompt:
             create_params["system"] = system_prompt
+        # Reasoning models routed through Anthropic-compatible gateways return
+        # a leading "thinking" content block, which content[0].text below cannot
+        # parse. Disable extended thinking by default; callers that explicitly
+        # request it via kwargs (already merged above) keep their setting.
+        create_params.setdefault("thinking", {"type": "disabled"})
         response = await anthropic_async_client.messages.create(**create_params)
     except APITimeoutError as e:
         # APITimeoutError subclasses APIConnectionError, so it must come first

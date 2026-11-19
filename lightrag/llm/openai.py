@@ -3,6 +3,7 @@ import os
 import logging
 import warnings
 
+from types import SimpleNamespace
 from collections.abc import AsyncIterator
 
 import pipmaster as pm
@@ -285,6 +286,109 @@ def create_openai_async_client(
 # Token-limit-truncated completions (finish_reason == "length") are returned
 # wrapped in TruncatedResponse so the cache layer skips persisting incomplete
 # output. See the "Note on truncated structured output" in the docstring below.
+def _adapt_anthropic_stream(response):
+    """Wrap an Anthropic-shaped SSE stream into OpenAI-style chunks.
+
+    Anthropic-compatible gateways serving the OpenAI chat protocol may answer
+    a streaming request with Anthropic events (message_start /
+    content_block_delta / message_delta ...). The OpenAI SDK passes each event
+    through as a ChatCompletionChunk with ``choices=None`` and the raw event
+    fields attached, so the OpenAI streaming loop below (which requires
+    ``chunk.choices[0].delta``) would silently drop every event and yield an
+    empty answer.
+
+    This adapter translates in flight: ``content_block_delta`` events whose
+    delta is a ``text_delta`` become chunks carrying
+    ``choices[0].delta.content``; ``message_delta`` maps stop_reason
+    ``max_tokens`` to finish_reason ``length``; ``message_start``/``message_delta``
+    usage (input_tokens/output_tokens) is mapped to prompt/completion tokens.
+    Thinking blocks (``thinking_delta``) are dropped, matching the non-streaming
+    adapter. Events that carry no translatable payload (ping, message_stop,
+    content_block_start/stop) are skipped. Non-Anthropic streams — detected by
+    the presence of a usable ``choices`` on the first event — pass through
+    untouched, so genuine OpenAI streaming never pays for this.
+    """
+
+    def _field(obj, key):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    async def _translate():
+        async for chunk in response:
+            if getattr(chunk, "choices", None) is not None:
+                # Genuine OpenAI-style chunk — pass through untouched.
+                yield chunk
+                continue
+            event_type = _field(chunk, "type")
+            if event_type == "content_block_delta":
+                delta = _field(chunk, "delta")
+                if _field(delta, "type") != "text_delta":
+                    continue  # thinking_delta and other non-text blocks
+                text = _field(delta, "text") or ""
+                if not text:
+                    continue
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=text, reasoning_content=None),
+                            finish_reason=None,
+                        )
+                    ],
+                    usage=None,
+                )
+            elif event_type == "message_delta":
+                usage = _field(chunk, "usage")
+                stop_reason = _field(chunk, "delta") and _field(
+                    _field(chunk, "delta"), "stop_reason"
+                )
+                adapted_usage = None
+                if usage is not None:
+                    input_tokens = _field(usage, "input_tokens") or 0
+                    output_tokens = _field(usage, "output_tokens") or 0
+                    adapted_usage = SimpleNamespace(
+                        prompt_tokens=input_tokens,
+                        completion_tokens=output_tokens,
+                        total_tokens=input_tokens + output_tokens,
+                    )
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=None, reasoning_content=None),
+                            finish_reason=(
+                                "length"
+                                if stop_reason == "max_tokens"
+                                else ("stop" if stop_reason else None)
+                            ),
+                        )
+                    ],
+                    usage=adapted_usage,
+                )
+            elif event_type == "message_start":
+                message = _field(chunk, "message")
+                usage = _field(message, "usage")
+                if usage is None:
+                    continue
+                input_tokens = _field(usage, "input_tokens") or 0
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=None, reasoning_content=None),
+                            finish_reason=None,
+                        )
+                    ],
+                    usage=SimpleNamespace(
+                        prompt_tokens=input_tokens,
+                        completion_tokens=0,
+                        total_tokens=input_tokens,
+                    ),
+                )
+            # ping / content_block_start / content_block_stop / message_stop
+            # carry no translatable payload — skipped.
+
+    return _translate()
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -502,9 +606,83 @@ async def openai_complete_if_cache(
         # returned unchanged so upstream tolerant JSON parsing can still
         # salvage them; finish_reason is only inspected when content is empty
         # (see the empty-content diagnostics below).
+        # Disable extended thinking for Anthropic-compatible gateways serving
+        # reasoning models behind the OpenAI chat protocol: without it the
+        # model may burn the whole output budget on its trace and return an
+        # empty text block. Routed through extra_body — the OpenAI SDK
+        # rejects unknown top-level keywords client-side, but forwards
+        # extra_body verbatim, and genuine OpenAI endpoints ignore unknown
+        # body fields. A caller-provided extra_body keeps its own "thinking".
+        extra_body = dict(kwargs.pop("extra_body", None) or {})
+        extra_body.setdefault("thinking", {"type": "disabled"})
+        kwargs["extra_body"] = extra_body
         response = await openai_async_client.chat.completions.create(
             model=api_model, messages=messages, **kwargs
         )
+        # Streaming responses from Anthropic-shaped gateways arrive as raw
+        # Anthropic SSE events (choices=None on every chunk); translate them
+        # into OpenAI-style chunks before the streaming loop consumes them.
+        if hasattr(response, "__aiter__"):
+            response = _adapt_anthropic_stream(response)
+        # Anthropic-compatible gateways may answer the OpenAI chat endpoint
+        # with an Anthropic-shaped body (top-level "content" block array, no
+        # "choices"). The OpenAI SDK still constructs a ChatCompletion, but
+        # with choices=None and the raw "content" passed through — as a list
+        # of dicts (SDK parse of untyped JSON) or of objects. Adapt it into
+        # the OpenAI shape the code below parses: concatenate the non-thinking
+        # text blocks as message.content, map stop_reason "max_tokens" to
+        # finish_reason "length", and usage input_tokens/output_tokens to
+        # prompt/completion tokens. Only runs when choices is absent, so
+        # genuine OpenAI responses are untouched.
+        if getattr(response, "choices", None) is None and isinstance(
+            getattr(response, "content", None), list
+        ):
+            def _block_field(block, key):
+                if isinstance(block, dict):
+                    return block.get(key)
+                return getattr(block, key, None)
+
+            text_parts = [
+                _block_field(block, "text") or ""
+                for block in response.content
+                if _block_field(block, "type") == "text"
+            ]
+            stop_reason = getattr(response, "stop_reason", None)
+            usage = getattr(response, "usage", None)
+            adapted_message = SimpleNamespace(
+                content="".join(text_parts),
+                reasoning_content=None,
+                parsed=None,
+            )
+            adapted_choice = SimpleNamespace(
+                message=adapted_message,
+                finish_reason="length" if stop_reason == "max_tokens" else "stop",
+            )
+            adapted_usage = None
+            if usage is not None:
+                input_tokens = (
+                    getattr(usage, "input_tokens", None)
+                    if not isinstance(usage, dict)
+                    else usage.get("input_tokens")
+                ) or 0
+                output_tokens = (
+                    getattr(usage, "output_tokens", None)
+                    if not isinstance(usage, dict)
+                    else usage.get("output_tokens")
+                ) or 0
+                adapted_usage = SimpleNamespace(
+                    prompt_tokens=input_tokens,
+                    completion_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                )
+            response = SimpleNamespace(
+                choices=[adapted_choice],
+                usage=adapted_usage,
+            )
+            logger.debug(
+                "Adapted Anthropic-shaped response from OpenAI-compatible "
+                "endpoint (content blocks → choices)"
+            )
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
         try:
