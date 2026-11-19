@@ -1360,6 +1360,37 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     shifted 43 of them. See ``tests/test_dataclass_positional_compatibility.py``.
     """
 
+    entity_disambiguation_hook: Callable | None = field(default=None)
+    """
+    Optional entity-name disambiguation hook, run ONCE PER MERGE after the
+    ``all_nodes`` candidate set is aggregated and BEFORE any graph/vector
+    mutation. Called as ``await hook(all_nodes, entity_vdb, global_config)``
+    and must return a new ``all_nodes`` dict (``{canonical_name: [entity_dict]}``)
+    of the same shape. ``None`` (the default) leaves the merge unchanged.
+
+    It may fold multiple names that refer to the same real-world entity into
+    one canonical key; the folded records then flow through the existing merge
+    (type voting, description dedup, source-id join) unchanged. A raising hook
+    fails the merge. ``entity_vdb`` is the entity vector store (has
+    ``.query`` / ``.embedding_func``); ``global_config`` carries ``workspace``
+    and other instance settings. Sync or async. See
+    ``lightrag/disambiguate.py`` for a reference implementation.
+    """
+
+    entity_name_candidate_hook: Callable | None = field(default=None)
+    """
+    Optional per-chunk candidate-name hook, run BEFORE entity extraction.
+
+    Called once per chunk as ``await hook(chunk_text, entity_vdb,
+    global_config)`` and must return a list of existing entity names (or
+    ``None``/``[]`` for none). The names are injected into the extraction user
+    prompt as ``---Existing Entities---`` so the model reuses an existing name
+    when the chunk refers to the same real-world entity. ``None`` (the default)
+    leaves the prompt byte-identical. ``entity_vdb`` is the entity vector store
+    (has ``.query``); a raising hook fails the chunk's extraction. See
+    ``lightrag/disambiguate.py`` for a reference implementation.
+    """
+
     def _mark_addon_params_dirty(self) -> None:
         self._addon_params_dirty = True
 
@@ -1599,6 +1630,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # state would be lost silently. A plain function is deep-copied
         # atomically and was never affected, which is why this is easy to miss.
         global_config["kg_extraction_validator"] = self.kg_extraction_validator
+        global_config["entity_disambiguation_hook"] = self.entity_disambiguation_hook
+        global_config["entity_name_candidate_hook"] = self.entity_name_candidate_hook
         global_config.pop("_addon_params", None)
         global_config.pop("_addon_params_dirty", None)
         global_config.pop("_cached_entity_extraction_use_json", None)
@@ -3775,6 +3808,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
                 truncation_tally=truncation_tally,
+                entity_vdb=self.entities_vdb,
             )
             return chunk_results
         except Exception as e:

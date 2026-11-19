@@ -3654,6 +3654,18 @@ async def merge_nodes_and_edges(
             all_edges[sorted_edge_key].extend(edges)
         await _cooperative_yield(i, every=32)
 
+    # Optional entity-name disambiguation hook: run ONCE PER MERGE after the
+    # candidate set is aggregated and before any graph/vector/tracking
+    # mutation. It may fold multiple names that refer to the same real-world
+    # entity into one canonical key; the folded records then flow through the
+    # existing merge unchanged. ``None`` leaves the merge untouched.
+    disambiguation_hook = global_config.get("entity_disambiguation_hook")
+    if disambiguation_hook is not None:
+        disambiguated = disambiguation_hook(all_nodes, entity_vdb, global_config)
+        if inspect.isawaitable(disambiguated):
+            disambiguated = await disambiguated
+        all_nodes = disambiguated
+
     total_entities_count = len(all_nodes)
     total_relations_count = len(all_edges)
 
@@ -3947,6 +3959,7 @@ async def extract_entities(
     llm_response_cache: BaseKVStorage | None = None,
     text_chunks_storage: BaseKVStorage | None = None,
     truncation_tally: TokenLimitTruncationTally | None = None,
+    entity_vdb: BaseVectorStorage | None = None,
 ) -> list:
     """Extract entities and relations from ``chunks``.
 
@@ -3981,6 +3994,7 @@ async def extract_entities(
     # Optional per-chunk extraction-quality hook; None leaves the pipeline
     # unchanged. See the call site in _process_single_content below.
     kg_extraction_validator = global_config.get("kg_extraction_validator")
+    entity_name_candidate_hook = global_config.get("entity_name_candidate_hook")
 
     use_llm_func: callable = global_config["role_llm_funcs"]["extract"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
@@ -4130,6 +4144,31 @@ async def extract_entities(
             else ""
         )
 
+        # Optional per-chunk candidate-name block: existing entity names that
+        # may be the same real-world entity as one in this chunk. Injected into
+        # the user prompt only (system prompt is chunk-invariant). Empty when
+        # the hook is disabled or returns no candidates, keeping the prompt
+        # byte-identical to the no-candidate form.
+        candidate_entities_block = ""
+        if entity_name_candidate_hook is not None:
+            candidates = entity_name_candidate_hook(
+                content, entity_vdb, global_config
+            )
+            if inspect.isawaitable(candidates):
+                candidates = await candidates
+            if candidates:
+                candidate_lines = "\n".join(
+                    f"- {name}" for name in candidates if name
+                )
+                candidate_entities_block = (
+                    "---Existing Entities---\n"
+                    "The following entities already exist in the knowledge "
+                    "graph. If an entity in the input text refers to the same "
+                    "real-world entity as one below, reuse that existing name "
+                    "exactly instead of introducing a new one.\n"
+                    f"{candidate_lines}\n\n"
+                )
+
         def _report_truncation(result: str, stage: str) -> None:
             if not is_truncated_response(result):
                 return
@@ -4190,6 +4229,7 @@ async def extract_entities(
                     **context_base,
                     "input_text": content,
                     "heading_context_block": heading_context_block,
+                    "candidate_entities_block": candidate_entities_block,
                 }
             )
         else:
@@ -4206,6 +4246,7 @@ async def extract_entities(
                     **context_base,
                     "input_text": content,
                     "heading_context_block": heading_context_block,
+                    "candidate_entities_block": candidate_entities_block,
                 }
             )
             entity_continue_extraction_user_prompt = PROMPTS[

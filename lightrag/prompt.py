@@ -134,7 +134,7 @@ Extract entities and relationships from the `---Input Text---` section below.
 4. **Completion Signal:** Output `{completion_delimiter}` as the final line after all relevant entities and relationships have been extracted and presented. If the row limit is reached, output `{completion_delimiter}` immediately after the last allowed row.
 5. **Output Language:** Ensure the output language is {language}. Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
 
-{heading_context_block}---Input Text---
+{heading_context_block}{candidate_entities_block}---Input Text---
 ```
 {input_text}
 ```
@@ -244,7 +244,7 @@ Extract entities and relationships from the `---Input Text---` section below.
 ---Entity Types---
 {entity_types_guidance}
 
-{heading_context_block}---Input Text---
+{heading_context_block}{candidate_entities_block}---Input Text---
 ```
 {input_text}
 ```

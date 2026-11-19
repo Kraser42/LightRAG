@@ -1277,6 +1277,7 @@ def _render_text_user_prompt(heading_context_block: str) -> str:
         language="English",
         input_text="Alice founded Acme Corp.",
         heading_context_block=heading_context_block,
+        candidate_entities_block="",
     )
 
 
@@ -1290,6 +1291,7 @@ def _render_json_user_prompt(heading_context_block: str) -> str:
         entity_types_guidance="- Person: humans",
         input_text="Alice founded Acme Corp.",
         heading_context_block=heading_context_block,
+        candidate_entities_block="",
     )
 
 
@@ -1364,7 +1366,7 @@ def test_text_user_prompt_section_context_hidden_and_byte_identical_when_no_head
     # pre-change template). This is the hard no-noise regression guard.
     baseline_template = PROMPTS["entity_extraction_user_prompt"].replace(
         "{heading_context_block}", ""
-    )
+    ).replace("{candidate_entities_block}", "")
     baseline = baseline_template.format(
         max_total_records=100,
         max_entity_records=40,
@@ -1384,7 +1386,7 @@ def test_json_user_prompt_section_context_hidden_and_byte_identical_when_no_head
 
     baseline_template = PROMPTS["entity_extraction_json_user_prompt"].replace(
         "{heading_context_block}", ""
-    )
+    ).replace("{candidate_entities_block}", "")
     baseline = baseline_template.format(
         max_total_records=100,
         max_entity_records=40,
